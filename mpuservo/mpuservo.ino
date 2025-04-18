@@ -1,7 +1,6 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Servo.h>
-#define MPU 0x68  // I2C address of the MPU-6050
 
 Servo ServoX, ServoY;
 double AcX, AcY, AcZ;
