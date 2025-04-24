@@ -6,12 +6,12 @@
 Servo servoAz;    // D9
 Servo servoEl;    // D10
 Servo servoPh;    // D11
-const int PIN_AZ = 9, PIN_EL = 10, PIN_PH = 11;
+const int PIN_AZ = 9, PIN_EL = 10, PIN_PH = 12;
 
 // Joystick for MANUAL mode
 const int PIN_VRX = A0;   // X → θ
 const int PIN_VRY = A1;   // Y → α
-const int PIN_SW  = 12;   // push → increment φ
+const int PIN_SW  = A2;   // pot → increment φ
 
 // Keypad for WAYPOINT entry
 const byte ROWS = 4, COLS = 4;
@@ -75,7 +75,7 @@ void handleWaypoint(char k) {
       buf[axisIdx-1].remove(buf[axisIdx-1].length()-1);
   }
   else if(k=='B') { // decimal point
-    if(!buf[axisIdx-1].contains("."))
+    if(buf[axisIdx-1].indexOf("."))
       buf[axisIdx-1] += ".";
   }
   else if(k=='A') { // toggle negative
@@ -143,7 +143,7 @@ void setup(){
   servoAz.attach(PIN_AZ);
   servoEl.attach(PIN_EL);
   servoPh.attach(PIN_PH);
-  pinMode(PIN_SW, INPUT_PULLUP);
+  servoPh.attach(PIN_SW);
   Serial.println("Ready. 'D'→MANUAL, '#'→WAYPOINT");
 }
 
@@ -157,21 +157,16 @@ void loop(){
   if(mode==MANUAL) {
     float vx = analogRead(PIN_VRX)/1023.0;
     float vy = analogRead(PIN_VRY)/1023.0;
-    static float phi=90.0;
-    static int lastBtn=HIGH;
-    int btn=digitalRead(PIN_SW);
-    if(lastBtn==HIGH&&btn==LOW){
-      phi+=5; if(phi>180) phi=0;
-    }
-    lastBtn=btn;
+    float vz = analogRead(PIN_SW)/1023.0;
     float th=vx*360.0;
     float el=vy*180.0-90.0;
+  	float ph=vz*180.0-90.0;
     servoAz.write(th);
     servoEl.write(el+90);
-    servoPh.write(phi);
+    servoPh.write(ph);
     Serial.print("MANUAL→ θ="); Serial.print(th);
     Serial.print(" α="); Serial.print(el);
-    Serial.print(" φ="); Serial.println(phi);
+    Serial.print(" φ="); Serial.println(ph);
     delay(100);
   }
 }
