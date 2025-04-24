@@ -2,182 +2,173 @@
 #include <Keypad.h>
 
 // ─── SECTION 1: PIN & HARDWARE SETUP ────────────────────────────────
+// Servos for θ (azimuth), α (elevation), φ (elbow)
+Servo servoAz;    // D9
+Servo servoEl;    // D10
+Servo servoPh;    // D11
+const int PIN_AZ = 9, PIN_EL = 10, PIN_PH = 11;
 
-// Servos
-Servo servoAz;    // θ
-Servo servoEl;    // α
-Servo servoPh;    // φ
-const int PIN_AZ = 9;
-const int PIN_EL = 10;
-const int PIN_PH = 11;
+// Joystick for MANUAL mode
+const int PIN_VRX = A0;   // X → θ
+const int PIN_VRY = A1;   // Y → α
+const int PIN_SW  = 12;   // push → increment φ
 
-// Joystick
-const int PIN_VRX = A0;   // analog X → θ
-const int PIN_VRY = A1;   // analog Y → α
-const int PIN_SW  = 12;   // push → φ step
-
-// Keypad
+// Keypad for WAYPOINT entry
 const byte ROWS = 4, COLS = 4;
 char keys[ROWS][COLS] = {
   {'1','2','3','A'},
-  {'4','5','6','B'},
-  {'7','8','9','C'},
-  {'*','0','#','D'}
+  {'4','5','6','B'},  // 'B' will be our decimal point
+  {'7','8','9','C'},  // 'C' not used
+  {'*','0','#','D'}   // '*' = backspace, '#' = confirm axis, 'D' = toggle MANUAL
 };
 byte rowPins[ROWS] = {2,3,4,5};
 byte colPins[COLS] = {6,7,8,11};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-// Operation modes
+// Modes
 enum Mode { WAYPOINT, MANUAL };
 Mode mode = WAYPOINT;
 
 // ─── SECTION 2: IK SOLVER (2-LINK, unit lengths) ────────────────────
 bool solveIK(float P[3], float angles[3]) {
-  const float l1 = 1.0, l2 = 1.0;
+  const float l1=1.0, l2=1.0;
   float r = sqrt(P[0]*P[0] + P[1]*P[1] + P[2]*P[2]);
-  if (r > l1 + l2 || r < fabs(l1 - l2)) return false;
-
+  if(r>l1+l2||r<fabs(l1-l2)) return false;
   // ex = P/r
-  float ex[3] = { P[0]/r, P[1]/r, P[2]/r };
-
-  // ez = ex × k  (k = [0,0,1])
-  float ez[3] = {
-    ex[1]*1.0f - ex[2]*0.0f,
-    ex[2]*0.0f - ex[0]*1.0f,
-    ex[0]*0.0f - ex[1]*0.0f
-  };
-  float normEZ = sqrt(ez[0]*ez[0] + ez[1]*ez[1] + ez[2]*ez[2]);
-  if (normEZ < 1e-6f) {
-    ez[0]=1; ez[1]=0; ez[2]=0;
-  } else {
-    ez[0]/=normEZ; ez[1]/=normEZ; ez[2]/=normEZ;
-  }
-
+  float ex[3]={P[0]/r,P[1]/r,P[2]/r};
+  // ez = ex × k
+  float ez[3]={ ex[1], -ex[0], 0 };
+  float n= sqrt(ez[0]*ez[0]+ez[1]*ez[1]+ez[2]*ez[2]);
+  if(n<1e-6){ ez[0]=1; ez[1]=0; ez[2]=0; } else { ez[0]/=n; ez[1]/=n; ez[2]/=n; }
   // ey = ez × ex
-  float ey[3] = {
-    ez[1]*ex[2] - ez[2]*ex[1],
-    ez[2]*ex[0] - ez[0]*ex[2],
-    ez[0]*ex[1] - ez[1]*ex[0]
-  };
-
-  // law of cosines for shoulder
-  float cosA1 = (l1*l1 + r*r - l2*l2) / (2*l1*r);
-  cosA1 = constrain(cosA1, -1.0f, 1.0f);
-  float a1 = acos(cosA1);
-
+  float ey[3]={ ez[1]*ex[2]-ez[2]*ex[1],
+                ez[2]*ex[0]-ez[0]*ex[2],
+                ez[0]*ex[1]-ez[1]*ex[0] };
+  // law of cosines
+  float cosA1=(l1*l1 + r*r - l2*l2)/(2*l1*r);
+  cosA1=constrain(cosA1,-1.0f,1.0f);
+  float a1=acos(cosA1);
   // v1 = cos(a1)*ex + sin(a1)*ey
-  float v1[3] = {
-    cos(a1)*ex[0] + sin(a1)*ey[0],
-    cos(a1)*ex[1] + sin(a1)*ey[1],
-    cos(a1)*ex[2] + sin(a1)*ey[2]
-  };
-
-  // v2dir = P - v1; normalize → v2
-  float v2dir[3] = { P[0]-v1[0], P[1]-v1[1], P[2]-v1[2] };
-  float normV2 = sqrt(v2dir[0]*v2dir[0] + v2dir[1]*v2dir[1] + v2dir[2]*v2dir[2]);
-  float v2[3] = { v2dir[0]/normV2, v2dir[1]/normV2, v2dir[2]/normV2 };
-
-  // Extract angles
-  float theta = atan2(v1[1], v1[0]) * 180.0f/PI;                // [-180,180]
-  float alpha = asin(v1[2])         * 180.0f/PI;                // [-90,90]
-  float phi   = acos(constrain(
-                      v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2],
-                      -1.0f,1.0f)) * 180.0f/PI;               // [0,180]
-
-  angles[0] = theta;  // horiz servo
-  angles[1] = alpha;  // elevation servo
-  angles[2] = phi;    // elbow servo
+  float v1[3]={ cos(a1)*ex[0]+sin(a1)*ey[0],
+                cos(a1)*ex[1]+sin(a1)*ey[1],
+                cos(a1)*ex[2]+sin(a1)*ey[2] };
+  // v2 = normalize(P - v1)
+  float v2d[3]={P[0]-v1[0],P[1]-v1[1],P[2]-v1[2]};
+  float n2=sqrt(v2d[0]*v2d[0]+v2d[1]*v2d[1]+v2d[2]*v2d[2]);
+  float v2[3]={v2d[0]/n2,v2d[1]/n2,v2d[2]/n2};
+  // extract angles
+  angles[0]=atan2(v1[1],v1[0])*180.0/PI;        // θ [-180,180]
+  angles[1]=asin(constrain(v1[2],-1.0f,1.0f))*180.0/PI;  // α [-90,90]
+  angles[2]=acos(constrain(v1[0]*v2[0]+v1[1]*v2[1]+v1[2]*v2[2],-1.0f,1.0f))*180.0/PI; // φ
   return true;
 }
 
-// ─── SECTION 3: INPUT MANAGEMENT ────────────────────────────────────
-float target[3] = {0,0,0};
-bool negFlag = false;
-int entryAxis = 0;  // 0=done, 1=X→2=Y→3=Z
+// ─── SECTION 3: WAYPOINT ENTRY BUFFERS ──────────────────────────────
+String buf[3] = {"","",""};     // text buffers for X,Y,Z
+int axisIdx = 0;                // 0=not entering, 1=X,2=Y,3=Z
 
-void handleKeypad(char k) {
-  if (k=='D') {
-    mode = MANUAL;
-    Serial.println("Mode → MANUAL");
-    return;
+// Handle a single keypress in WAYPOINT mode
+void handleWaypoint(char k) {
+  if(axisIdx==0) return;
+  if(k=='*') { // backspace
+    if(buf[axisIdx-1].length()>0)
+      buf[axisIdx-1].remove(buf[axisIdx-1].length()-1);
   }
-  if (k=='#') {
-    mode = WAYPOINT;
-    entryAxis = 1;
-    negFlag = false;
-    Serial.println("Mode → WAYPOINT (enter X,Y,Z; '*' toggles sign)");
-    return;
+  else if(k=='B') { // decimal point
+    if(!buf[axisIdx-1].contains("."))
+      buf[axisIdx-1] += ".";
   }
-  if (mode==WAYPOINT && entryAxis>0 && entryAxis<=3) {
-    if (k=='*') {
-      negFlag = !negFlag;
-      Serial.print("Axis "); Serial.print(entryAxis);
-      Serial.print(" sign = "); Serial.println(negFlag?"-":"+");
-      return;
-    }
-    if (k>='0' && k<='9') {
-      float val = float(k - '0');
-      if (negFlag) val = -val;
-      target[entryAxis-1] = val;
-      Serial.print("Axis "); Serial.print(entryAxis);
-      Serial.print(" set = "); Serial.println(val);
-      entryAxis++;
-      negFlag=false;
-      if (entryAxis>3) {
-        // all 3 done → solve IK & move
-        float ang[3];
-        if (solveIK(target, ang)) {
-          Serial.print("IK→ θ="); Serial.print(ang[0]);
-          Serial.print(" α="); Serial.print(ang[1]);
-          Serial.print(" φ="); Serial.println(ang[2]);
-          servoAz.write(ang[0]);
-          servoEl.write(ang[1] + 90); 
-          servoPh.write(ang[2]);
+  else if(k=='A') { // toggle negative
+    if(buf[axisIdx-1].startsWith("-"))
+      buf[axisIdx-1].remove(0,1);
+    else
+      buf[axisIdx-1] = "-" + buf[axisIdx-1];
+  }
+  else if(k>='0' && k<='9') { // digit
+    buf[axisIdx-1] += k;
+  }
+  else if(k=='#') { // confirm this axis
+    if(buf[axisIdx-1].length()>0) {
+      float val = buf[axisIdx-1].toFloat();
+      float target[3];
+      static float targ[3];
+      targ[axisIdx-1] = val;
+      Serial.print("Set ");
+      Serial.print(axisIdx==1?"X":axisIdx==2?"Y":"Z");
+      Serial.print(" = "); Serial.println(val);
+      axisIdx++;
+      if(axisIdx>3) {
+        // all three entered → solve & move
+        if(solveIK(targ, targ)) {
+          Serial.print("Moving to waypoint: ");
+          Serial.print(targ[0]); Serial.print(", ");
+          Serial.print(targ[1]); Serial.print(", ");
+          Serial.println(targ[2]);
+          servoAz.write(targ[0]);
+          servoEl.write(targ[1]+90);
+          servoPh.write(targ[2]);
         } else {
-          Serial.println("❌ Unreachable waypoint");
+          Serial.println("❌ Unreachable");
         }
-        entryAxis = 0;
+        axisIdx=0; // reset entry
+      } else {
+        buf[axisIdx-1] = ""; // clear next buffer
+        Serial.print("Enter ");
+        Serial.println(axisIdx==2?"Y":"Z");
       }
     }
   }
 }
 
-// ─── SECTION 4: SETUP ───────────────────────────────────────────────
+// ─── SECTION 4: KEY HANDLING ─────────────────────────────────────────
+void handleKeypad(char k) {
+  if(k=='D') { // toggle manual
+    mode=MANUAL;
+    Serial.println("Mode → MANUAL");
+  }
+  else if(k=='#' && mode==MANUAL) { // start waypoint entry
+    mode=WAYPOINT;
+    axisIdx=1;
+    buf[0]=buf[1]=buf[2]="";
+    Serial.println("Mode → WAYPOINT. Enter X:");
+  }
+  else if(mode==WAYPOINT) {
+    handleWaypoint(k);
+  }
+}
+
+// ─── SECTION 5: SETUP ───────────────────────────────────────────────
 void setup(){
   Serial.begin(9600);
   servoAz.attach(PIN_AZ);
   servoEl.attach(PIN_EL);
   servoPh.attach(PIN_PH);
   pinMode(PIN_SW, INPUT_PULLUP);
-  Serial.println("Ready. '#'→WAYPOINT, 'D'→MANUAL");
+  Serial.println("Ready. 'D'→MANUAL, '#'→WAYPOINT");
 }
 
-// ─── SECTION 5: MAIN LOOP ──────────────────────────────────────────
+// ─── SECTION 6: MAIN LOOP ──────────────────────────────────────────
 void loop(){
-  // 1) keypad
+  // Poll keypad
   char key = keypad.getKey();
-  if (key) handleKeypad(key);
+  if(key) handleKeypad(key);
 
-  // 2) joystick/manual
-  if (mode==MANUAL) {
-    float vx = analogRead(PIN_VRX)/1023.0f;
-    float vy = analogRead(PIN_VRY)/1023.0f;
-    static float phi = 90.0f;
-    static int lastBtn = HIGH;
-    int btn = digitalRead(PIN_SW);
-    if (lastBtn==HIGH && btn==LOW) {
-      phi += 5.0f;
-      if (phi>180) phi=0;
+  // Manual joystick control
+  if(mode==MANUAL) {
+    float vx = analogRead(PIN_VRX)/1023.0;
+    float vy = analogRead(PIN_VRY)/1023.0;
+    static float phi=90.0;
+    static int lastBtn=HIGH;
+    int btn=digitalRead(PIN_SW);
+    if(lastBtn==HIGH&&btn==LOW){
+      phi+=5; if(phi>180) phi=0;
     }
-    lastBtn = btn;
-
-    float th = vx * 360.0f;
-    float el = vy * 180.0f - 90.0f;
+    lastBtn=btn;
+    float th=vx*360.0;
+    float el=vy*180.0-90.0;
     servoAz.write(th);
-    servoEl.write(el + 90);
+    servoEl.write(el+90);
     servoPh.write(phi);
-
     Serial.print("MANUAL→ θ="); Serial.print(th);
     Serial.print(" α="); Serial.print(el);
     Serial.print(" φ="); Serial.println(phi);
