@@ -2,52 +2,57 @@
 #include <math.h>
 
 // ——— Pin assignments ———
-constexpr int PIN_SERVO_PF = 3;
-constexpr int PIN_SERVO_PB = 9;
-constexpr int PIN_SERVO_YL = 6;
-constexpr int PIN_SERVO_YR = 5;
-constexpr int PIN_JOYSTICK_X = A4;
-constexpr int PIN_JOYSTICK_Y = A5;
+constexpr int PIN_SERVO_PF    = 3;
+constexpr int PIN_SERVO_PB    = 5;
+constexpr int PIN_SERVO_YL    = 6;
+constexpr int PIN_SERVO_YR    = 9;
+constexpr int PIN_JOYSTICK_X  = A4;
+constexpr int PIN_JOYSTICK_Y  = A5;
 
 // ——— Servos ———
 Servo servoPF, servoPB, servoYL, servoYR;
 
 // ——— State & target ———
-float posX = 0, posY = 0, posZ = 0;     // current simulated position (cm)
-float tx = 0, ty = 0, tz = 0;           // current waypoint (cm)
-bool manualMode = true;                 // start in manual
-bool aborted   = false;
+float posX = 0, posY = 0, posZ = 0;    // current simulated position (cm)
+float tx   = 0, ty   = 0, tz   = 0;    // current waypoint (cm)
+bool  manualMode = true;               // start in manual
+bool  aborted    = false;
 
 // ——— Timing & control ———
-constexpr float LOOP_DT       = 0.05;   // seconds per loop
-constexpr float REPORT_SEC    = 1.0;    // report once per second
+constexpr float LOOP_DT       = 0.05;  // seconds per loop
+constexpr float REPORT_SEC    = 1.0;   // report once per second
 constexpr int   LOOPS_PER_SEC = int(REPORT_SEC / LOOP_DT + 0.5);
 int loopCounter = 0;
 
-// ——— Aerodynamic & error tracking ———
-constexpr float SPEED       = 20.0;     // cm/s “thrust”
-constexpr float MAX_DEFLECT = 20.0;     // degrees max fin deflection
-float globalMinDist = 1e9;              // record of best approach
+// ——— Aerodynamics & error tracking ———
+constexpr float SPEED       = 20.0;    // cm/s “thrust”
+constexpr float MAX_DEFLECT = 20.0;    // degrees max fin deflection
+float globalMinDist = 1e9;             // record of best approach
 
 void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println(F("=== Rocket Nav Simulator ==="));
   Serial.println(F("Commands (type + NL):"));
-  Serial.println(F("  MODE AUTO    → autonomous"));
-  Serial.println(F("  MODE MAN     → manual joystick"));
-  Serial.println(F("  SET <x> <y> <z>  → reset waypoint (cm)"));
-  Serial.println(F("  ABORT        → pause simulation"));
+  Serial.println(F("  MODE AUTO       → switch to autonomous"));
+  Serial.println(F("  MODE MAN        → switch to manual joystick"));
+  Serial.println(F("  SET <x> <y> <z> → reset waypoint (cm)"));
+  Serial.println(F("  ABORT           → pause simulation"));
   Serial.println();
-  Serial.println(F("Manual: joystick on A4=X (yaw), A5=Y (pitch)"));
+  Serial.println(F("Manual: joystick on A4 = X (yaw), A5 = Y (pitch)"));
   Serial.println(F("--------------------------------"));
 
-  // attach servos
+  // Attach servos
   servoPF.attach(PIN_SERVO_PF);
   servoPB.attach(PIN_SERVO_PB);
   servoYL.attach(PIN_SERVO_YL);
   servoYR.attach(PIN_SERVO_YR);
   centerFins();
+
+  // Initialize position at (0,0,0); waypoint defaults to (0,0,0)
+  posX = posY = posZ = 0;
+  tx = ty = tz = 0;
+  globalMinDist = 1e9;
 }
 
 void loop() {
@@ -63,6 +68,7 @@ void loop() {
   simulateMotion();
   updateClosest();
 
+  // Report position once per second
   if (++loopCounter >= LOOPS_PER_SEC) {
     loopCounter = 0;
     reportPosition();
@@ -88,16 +94,17 @@ void handleSerial() {
   if (cmd.equalsIgnoreCase("MODE AUTO")) {
     manualMode = false;
     aborted = false;
-    posX = posY = posZ = 0;
-    globalMinDist = 1e9;
+    posX = posY = posZ = 0;       // reset position
+    globalMinDist = 1e9;         // reset best-approach record
     Serial.println(F("→ Switched to AUTONOMOUS; position reset to (0,0,0)"));
+    Serial.println(F("   (Set waypoint with: SET <x> <y> <z>)"));
     centerFins();
   }
   else if (cmd.equalsIgnoreCase("MODE MAN")) {
     manualMode = true;
     aborted = false;
-    posX = posY = posZ = 0;
-    globalMinDist = 1e9;
+    posX = posY = posZ = 0;       // reset position
+    globalMinDist = 1e9;         // reset best-approach record
     Serial.println(F("→ Switched to MANUAL; position reset to (0,0,0)"));
     centerFins();
   }
@@ -106,8 +113,8 @@ void handleSerial() {
     if (sscanf(cmd.c_str(), "SET %f %f %f", &x, &y, &z) == 3) {
       tx = x; ty = y; tz = z;
       Serial.print(F("→ Waypoint reset to ("));
-      Serial.print(tx,1); Serial.print(F(","));
-      Serial.print(ty,1); Serial.print(F(","));
+      Serial.print(tx,1); Serial.print(F(", "));
+      Serial.print(ty,1); Serial.print(F(", "));
       Serial.print(tz,1); Serial.println(F(")"));
       globalMinDist = 1e9;
     }
@@ -124,8 +131,8 @@ void manualStep() {
   int rawX = analogRead(PIN_JOYSTICK_X);
   int rawY = analogRead(PIN_JOYSTICK_Y);
   const float CENTER = 512.0;
-  float normX = (rawX - CENTER) / CENTER;     // -1..+1 for yaw
-  float normY = (CENTER - rawY) / CENTER;     // -1..+1 for pitch (inverted)
+  float normX = (rawX - CENTER) / CENTER;  // -1..+1 for yaw
+  float normY = (CENTER - rawY) / CENTER;  // -1..+1 for pitch (inverted)
   float defYaw   = constrain(normX * MAX_DEFLECT, -MAX_DEFLECT, +MAX_DEFLECT);
   float defPitch = constrain(normY * MAX_DEFLECT, -MAX_DEFLECT, +MAX_DEFLECT);
   applyFins(defPitch, defYaw);
@@ -138,7 +145,7 @@ void autonomousStep() {
   float dist = sqrt(ex*ex + ey*ey + ez*ez);
   if (dist < 1.0) {
     centerFins();
-    return;
+    return; 
   }
   float pitch = constrain(atan2(ez, ex) * 180.0/PI, -MAX_DEFLECT, +MAX_DEFLECT);
   float yaw   = constrain(atan2(ey, ex) * 180.0/PI, -MAX_DEFLECT, +MAX_DEFLECT);
@@ -177,15 +184,15 @@ void updateClosest() {
     Serial.print(F("🏁 New closest: "));
     Serial.print(d,1);
     Serial.print(F(" cm at POS("));
-    Serial.print(posX,1); Serial.print(F(","));
-    Serial.print(posY,1); Serial.print(F(","));
+    Serial.print(posX,1); Serial.print(F(", "));
+    Serial.print(posY,1); Serial.print(F(", "));
     Serial.print(posZ,1); Serial.println(F(")"));
   }
 }
 
 void reportPosition() {
   Serial.print(F("POS("));
-  Serial.print(posX,1); Serial.print(F(","));
-  Serial.print(posY,1); Serial.print(F(","));
+  Serial.print(posX,1); Serial.print(F(", "));
+  Serial.print(posY,1); Serial.print(F(", "));
   Serial.print(posZ,1); Serial.println(F(")"));
 }
