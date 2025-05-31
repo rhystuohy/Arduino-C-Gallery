@@ -1,0 +1,191 @@
+#include <Servo.h>
+#include <math.h>
+
+// ——— Pin assignments ———
+constexpr int PIN_SERVO_PF = 3;
+constexpr int PIN_SERVO_PB = 9;
+constexpr int PIN_SERVO_YL = 6;
+constexpr int PIN_SERVO_YR = 5;
+constexpr int PIN_JOYSTICK_X = A4;
+constexpr int PIN_JOYSTICK_Y = A5;
+
+// ——— Servos ———
+Servo servoPF, servoPB, servoYL, servoYR;
+
+// ——— State & target ———
+float posX = 0, posY = 0, posZ = 0;     // current simulated position (cm)
+float tx = 0, ty = 0, tz = 0;           // current waypoint (cm)
+bool manualMode = true;                 // start in manual
+bool aborted   = false;
+
+// ——— Timing & control ———
+constexpr float LOOP_DT       = 0.05;   // seconds per loop
+constexpr float REPORT_SEC    = 1.0;    // report once per second
+constexpr int   LOOPS_PER_SEC = int(REPORT_SEC / LOOP_DT + 0.5);
+int loopCounter = 0;
+
+// ——— Aerodynamic & error tracking ———
+constexpr float SPEED       = 20.0;     // cm/s “thrust”
+constexpr float MAX_DEFLECT = 20.0;     // degrees max fin deflection
+float globalMinDist = 1e9;              // record of best approach
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println(F("=== Rocket Nav Simulator ==="));
+  Serial.println(F("Commands (type + NL):"));
+  Serial.println(F("  MODE AUTO    → autonomous"));
+  Serial.println(F("  MODE MAN     → manual joystick"));
+  Serial.println(F("  SET <x> <y> <z>  → reset waypoint (cm)"));
+  Serial.println(F("  ABORT        → pause simulation"));
+  Serial.println();
+  Serial.println(F("Manual: joystick on A4=X (yaw), A5=Y (pitch)"));
+  Serial.println(F("--------------------------------"));
+
+  // attach servos
+  servoPF.attach(PIN_SERVO_PF);
+  servoPB.attach(PIN_SERVO_PB);
+  servoYL.attach(PIN_SERVO_YL);
+  servoYR.attach(PIN_SERVO_YR);
+  centerFins();
+}
+
+void loop() {
+  handleSerial();
+  if (aborted) return;
+
+  if (manualMode) {
+    manualStep();
+  } else {
+    autonomousStep();
+  }
+
+  simulateMotion();
+  updateClosest();
+
+  if (++loopCounter >= LOOPS_PER_SEC) {
+    loopCounter = 0;
+    reportPosition();
+  }
+
+  delay(int(LOOP_DT * 1000));
+}
+
+// ——— Helpers ———
+
+void centerFins() {
+  servoPF.write(90);
+  servoPB.write(90);
+  servoYL.write(90);
+  servoYR.write(90);
+}
+
+void handleSerial() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  if (cmd.equalsIgnoreCase("MODE AUTO")) {
+    manualMode = false;
+    aborted = false;
+    posX = posY = posZ = 0;
+    globalMinDist = 1e9;
+    Serial.println(F("→ Switched to AUTONOMOUS; position reset to (0,0,0)"));
+    centerFins();
+  }
+  else if (cmd.equalsIgnoreCase("MODE MAN")) {
+    manualMode = true;
+    aborted = false;
+    posX = posY = posZ = 0;
+    globalMinDist = 1e9;
+    Serial.println(F("→ Switched to MANUAL; position reset to (0,0,0)"));
+    centerFins();
+  }
+  else if (cmd.startsWith("SET ")) {
+    float x, y, z;
+    if (sscanf(cmd.c_str(), "SET %f %f %f", &x, &y, &z) == 3) {
+      tx = x; ty = y; tz = z;
+      Serial.print(F("→ Waypoint reset to ("));
+      Serial.print(tx,1); Serial.print(F(","));
+      Serial.print(ty,1); Serial.print(F(","));
+      Serial.print(tz,1); Serial.println(F(")"));
+      globalMinDist = 1e9;
+    }
+  }
+  else if (cmd.equalsIgnoreCase("ABORT")) {
+    aborted = true;
+    Serial.println(F("→ ABORTED: simulation paused. Type MODE AUTO or MODE MAN to restart."));
+    centerFins();
+  }
+}
+
+void manualStep() {
+  // Read joystick (0–1023)
+  int rawX = analogRead(PIN_JOYSTICK_X);
+  int rawY = analogRead(PIN_JOYSTICK_Y);
+  const float CENTER = 512.0;
+  float normX = (rawX - CENTER) / CENTER;     // -1..+1 for yaw
+  float normY = (CENTER - rawY) / CENTER;     // -1..+1 for pitch (inverted)
+  float defYaw   = constrain(normX * MAX_DEFLECT, -MAX_DEFLECT, +MAX_DEFLECT);
+  float defPitch = constrain(normY * MAX_DEFLECT, -MAX_DEFLECT, +MAX_DEFLECT);
+  applyFins(defPitch, defYaw);
+}
+
+void autonomousStep() {
+  float ex = tx - posX;
+  float ey = ty - posY;
+  float ez = tz - posZ;
+  float dist = sqrt(ex*ex + ey*ey + ez*ez);
+  if (dist < 1.0) {
+    centerFins();
+    return;
+  }
+  float pitch = constrain(atan2(ez, ex) * 180.0/PI, -MAX_DEFLECT, +MAX_DEFLECT);
+  float yaw   = constrain(atan2(ey, ex) * 180.0/PI, -MAX_DEFLECT, +MAX_DEFLECT);
+  applyFins(pitch, yaw);
+}
+
+void applyFins(float defPitch, float defYaw) {
+  int pf = constrain(90 - defPitch, 0, 180);
+  int pb = constrain(90 + defPitch, 0, 180);
+  int yl = constrain(90 - defYaw,   0, 180);
+  int yr = constrain(90 + defYaw,   0, 180);
+  servoPF.write(pf);
+  servoPB.write(pb);
+  servoYL.write(yl);
+  servoYR.write(yr);
+}
+
+void simulateMotion() {
+  float pfR = (servoPF.read() - 90) * PI/180.0;
+  float ylR = (servoYL.read() - 90) * PI/180.0;
+  float ux = cos(pfR) * cos(ylR);
+  float uy = sin(ylR);
+  float uz = sin(pfR) * cos(ylR);
+  posX += ux * SPEED * LOOP_DT;
+  posY += uy * SPEED * LOOP_DT;
+  posZ += uz * SPEED * LOOP_DT;
+}
+
+void updateClosest() {
+  float dx = tx - posX;
+  float dy = ty - posY;
+  float dz = tz - posZ;
+  float d  = sqrt(dx*dx + dy*dy + dz*dz);
+  if (d < globalMinDist) {
+    globalMinDist = d;
+    Serial.print(F("🏁 New closest: "));
+    Serial.print(d,1);
+    Serial.print(F(" cm at POS("));
+    Serial.print(posX,1); Serial.print(F(","));
+    Serial.print(posY,1); Serial.print(F(","));
+    Serial.print(posZ,1); Serial.println(F(")"));
+  }
+}
+
+void reportPosition() {
+  Serial.print(F("POS("));
+  Serial.print(posX,1); Serial.print(F(","));
+  Serial.print(posY,1); Serial.print(F(","));
+  Serial.print(posZ,1); Serial.println(F(")"));
+}
