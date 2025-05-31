@@ -15,8 +15,9 @@ Servo servoPF, servoPB, servoYL, servoYR;
 // ——— State & target ———
 float posX = 0, posY = 0, posZ = 0;    // current simulated position (cm)
 float tx   = 0, ty   = 0, tz   = 0;    // current waypoint (cm)
-bool  manualMode = true;               // start in manual
-bool  aborted    = false;
+bool  manualMode   = true;             // start in manual
+bool  aborted      = false;
+bool  waypointSet  = false;            // only true after SET command
 
 // ——— Timing & control ———
 constexpr float LOOP_DT       = 0.05;  // seconds per loop
@@ -36,7 +37,7 @@ void setup() {
   Serial.println(F("Commands (type + NL):"));
   Serial.println(F("  MODE AUTO       → switch to autonomous"));
   Serial.println(F("  MODE MAN        → switch to manual joystick"));
-  Serial.println(F("  SET <x> <y> <z> → reset waypoint (cm)"));
+  Serial.println(F("  SET <x> <y> <z> → set waypoint (integers, cm)"));
   Serial.println(F("  ABORT           → pause simulation"));
   Serial.println();
   Serial.println(F("Manual: joystick on A4 = X (yaw), A5 = Y (pitch)"));
@@ -49,9 +50,8 @@ void setup() {
   servoYR.attach(PIN_SERVO_YR);
   centerFins();
 
-  // Initialize position at (0,0,0); waypoint defaults to (0,0,0)
+  // Initialize position at (0,0,0); no waypoint set
   posX = posY = posZ = 0;
-  tx = ty = tz = 0;
   globalMinDist = 1e9;
 }
 
@@ -84,6 +84,7 @@ void centerFins() {
   servoPB.write(90);
   servoYL.write(90);
   servoYR.write(90);
+  Serial.println(F("→ Fins centered (90° each)"));
 }
 
 void handleSerial() {
@@ -95,28 +96,34 @@ void handleSerial() {
     manualMode = false;
     aborted = false;
     posX = posY = posZ = 0;       // reset position
-    globalMinDist = 1e9;         // reset best-approach record
+    globalMinDist = 1e9;
+    waypointSet = false;          // require SET before moving
     Serial.println(F("→ Switched to AUTONOMOUS; position reset to (0,0,0)"));
-    Serial.println(F("   (Set waypoint with: SET <x> <y> <z>)"));
+    Serial.println(F("   (Now send: SET <x> <y> <z> to define waypoint)"));
     centerFins();
   }
   else if (cmd.equalsIgnoreCase("MODE MAN")) {
     manualMode = true;
     aborted = false;
     posX = posY = posZ = 0;       // reset position
-    globalMinDist = 1e9;         // reset best-approach record
+    globalMinDist = 1e9;
+    waypointSet = false;          // clear any previous waypoint
     Serial.println(F("→ Switched to MANUAL; position reset to (0,0,0)"));
     centerFins();
   }
   else if (cmd.startsWith("SET ")) {
-    float x, y, z;
-    if (sscanf(cmd.c_str(), "SET %f %f %f", &x, &y, &z) == 3) {
-      tx = x; ty = y; tz = z;
-      Serial.print(F("→ Waypoint reset to ("));
+    // Parse three integer values after "SET "
+    int xi, yi, zi;
+    if (sscanf(cmd.c_str(), "SET %d %d %d", &xi, &yi, &zi) == 3) {
+      tx = xi; ty = yi; tz = zi;
+      waypointSet = true;
+      Serial.print(F("→ Waypoint set to ("));
       Serial.print(tx,1); Serial.print(F(", "));
       Serial.print(ty,1); Serial.print(F(", "));
       Serial.print(tz,1); Serial.println(F(")"));
       globalMinDist = 1e9;
+    } else {
+      Serial.println(F("! Invalid SET syntax (use: SET x y z)"));
     }
   }
   else if (cmd.equalsIgnoreCase("ABORT")) {
@@ -139,16 +146,26 @@ void manualStep() {
 }
 
 void autonomousStep() {
+  if (!waypointSet) {
+    // No waypoint yet: keep fins centered
+    centerFins();
+    return;
+  }
   float ex = tx - posX;
   float ey = ty - posY;
   float ez = tz - posZ;
   float dist = sqrt(ex*ex + ey*ey + ez*ez);
   if (dist < 1.0) {
     centerFins();
-    return; 
+    return;
   }
   float pitch = constrain(atan2(ez, ex) * 180.0/PI, -MAX_DEFLECT, +MAX_DEFLECT);
   float yaw   = constrain(atan2(ey, ex) * 180.0/PI, -MAX_DEFLECT, +MAX_DEFLECT);
+  Serial.print(F("→ Auto deflect: pitch="));
+  Serial.print(pitch,1);
+  Serial.print(F("°, yaw="));
+  Serial.print(yaw,1);
+  Serial.println(F("°"));
   applyFins(pitch, yaw);
 }
 
@@ -161,6 +178,11 @@ void applyFins(float defPitch, float defYaw) {
   servoPB.write(pb);
   servoYL.write(yl);
   servoYR.write(yr);
+  Serial.print(F("→ Servo angles PF,PB,YL,YR = "));
+  Serial.print(pf); Serial.print(F(", "));
+  Serial.print(pb); Serial.print(F(", "));
+  Serial.print(yl); Serial.print(F(", "));
+  Serial.println(yr);
 }
 
 void simulateMotion() {
@@ -175,6 +197,7 @@ void simulateMotion() {
 }
 
 void updateClosest() {
+  if (!waypointSet) return;
   float dx = tx - posX;
   float dy = ty - posY;
   float dz = tz - posZ;
