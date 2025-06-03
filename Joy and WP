@@ -1,334 +1,438 @@
+/*
+  Rocket Controller with JOYSTICK Manual Mode + AUTO (Waypoint) Mode
+  – Revised to ensure equal prioritization of X, Y, and Z:
+    • In AUTO mode, thrust is set high enough to overcome gravity continually
+      until the waypoint is reached (ignores fuel depletion).
+    • Uses a PD controller that points the rocket’s body axis directly at (X,Y,Z).
+    • Stops all motion and prints “Waypoint reached!” once within tolerance in 3D,
+      then waits for next “MAN” or “AUTO” command.
+    • Serial output every 500 ms.
+    • Servos:
+        Front → pin 3
+        Right → pin 9
+        Back  → pin 6
+        Left  → pin 5
+    • Joystick in MAN mode:
+        Pitch → A4
+        Yaw   → A5
+
+  Author: Combined & revised 2025-06-03
+*/
+
 #include <Servo.h>
+#include <Wire.h>
+#include <SPI.h>
 #include <math.h>
 
-// ——— Pin assignments ———
-constexpr int PIN_SERVO_PF    = 3;
-constexpr int PIN_SERVO_PB    = 5;
-constexpr int PIN_SERVO_YL    = 6;
-constexpr int PIN_SERVO_YR    = 9;
-constexpr int PIN_JOYSTICK_X  = A4;
-constexpr int PIN_JOYSTICK_Y  = A5;
+// === PIN ASSIGNMENTS ===
+const int PIN_SERVO_FRONT = 3;
+const int PIN_SERVO_RIGHT = 5;   // swapped
+const int PIN_SERVO_BACK  = 9;
+const int PIN_SERVO_LEFT  = 6;   // swapped
 
-// ——— Servos ———
-Servo servoPF, servoPB, servoYL, servoYR;
+const int PIN_JOYSTICK_PITCH = A4;  // vertical axis
+const int PIN_JOYSTICK_YAW   = A5;  // horizontal axis
 
-// ——— State & target ———
-float posX = 0.0f, posY = 0.0f, posZ = 0.0f;   // position (m)
-float tx   = 0.0f, ty   = 0.0f, tz   = 0.0f;   // waypoint (m)
-bool  manualMode   = true;    // start in manual
-bool  aborted      = false;
-bool  waypointSet  = false;   // true after SET
+// === CONSTANTS ===
+const float FIN_ANGLE_MAX  = 30.0;    // degrees
+const int   SERVO_CENTER   = 90;      // center PWM
+const int   SERVO_RANGE    = 60;      // ±30° span
 
-// ——— Timing & control ———
-constexpr float LOOP_DT       = 0.05f;  // 50 ms
-constexpr float REPORT_SEC    = 1.0f;   // 1 s
-constexpr int   LOOPS_PER_SEC = int(REPORT_SEC / LOOP_DT + 0.5f);
-int loopCounter = 0;
+const float MASS_TOTAL     = 20.0;    // kg (payload + “sufficient fuel”)
+const float THRUST_FACTOR  = 1.5;     // multiplier so thrust = 1.5 × weight
 
-// PID gains for pitch:
-constexpr float KP_PITCH = 0.7f;
-constexpr float KI_PITCH = 0.1f;
-constexpr float KD_PITCH = 0.05f;
+const float GRAVITY        = 9.81;    // m/s²
 
-// PID gains for yaw:
-constexpr float KP_YAW   = 0.7f;
-constexpr float KI_YAW   = 0.1f;
-constexpr float KD_YAW   = 0.05f;
+const float AIR_DENSITY    = 1.2;     // kg/m³
+const float AREA_ROCKET    = 0.1;     // m² (approx cross-sectional)
+const float CD_ROCKET      = 0.75;    // drag coefficient
 
-// Dynamics constants:
-constexpr float K_TORQUE = 1.0f;
-constexpr float I_MOMENT = 1.0f;
+const float WAYPOINT_TOL   = 2.0;     // meters tolerance for “reached”
 
-// Simulator constants:
-constexpr float SPEED       = 20.0f;  // m/s
-constexpr float MAX_DEFLECT = 20.0f;  // degrees
+// PD gains (tune if needed)
+const float Kp_pitch = 2.0;    // deg/s² per degree error
+const float Kd_pitch = 0.8;    // damping term
+const float Kp_yaw   = 2.0;
+const float Kd_yaw   = 0.8;
 
-// PID state
-float pitchErrorPrev = 0.0f;
-float pitchErrorI    = 0.0f;
-float yawErrorPrev   = 0.0f;
-float yawErrorI      = 0.0f;
+// === GLOBAL VARIABLES ===
+Servo finFront, finRight, finBack, finLeft;
 
-// Orientation state (rad) and angular velocity (rad/s)
-float pitchAngle = 0.0f, pitchRate = 0.0f;
-float yawAngle   = 0.0f, yawRate   = 0.0f;
+String mode = "MAN";      // “MAN” or “AUTO”
+bool isLaunched    = false;
+bool autoParamsSet = false;
+int  autoInputStage= 0;   // 0=X, 1=Y, 2=Z, 3=done
 
-// Current commanded fin deflections (deg)
-float defPitch = 0.0f, defYaw = 0.0f;
+unsigned long launchMillis     = 0;
+unsigned long lastUpdateMillis = 0;
+unsigned long lastPrintMillis  = 0;
 
-// Closest approach tracking
-float globalMinDist = 1e9;
+float posX = 0, posY = 0, posZ = 0;   // inertial position (m)
+float velX = 0, velY = 0, velZ = 0;   // inertial velocity (m/s)
+float accX = 0, accY = 0, accZ = 0;   // inertial acceleration (m/s²)
 
+float pitchDeg = 0, yawDeg = 0, rollDeg = 0;    // orientation (deg)
+float pitchRate = 0, yawRate = 0, rollRate = 0; // angular rates (deg/s)
+
+float waypointX = 0, waypointY = 0, waypointZ = 0;
+
+// === FUNCTION DECLARATIONS ===
+void setup();
+void loop();
+void handleSerial();
+void enterManualMode();
+void enterAutoMode();
+void manualModeLoop();
+void autoModeLoop();
+void updateRocketPhysics(float dt);
+float computeDragMagnitude(float vx, float vy, float vz);
+void computeAttitudeFromIMU(float dt);  // stub or IMU fusion
+void setAllFins(float frontDeg, float rightDeg, float backDeg, float leftDeg);
+float mapJoystickToAngle(int reading);
+
+// === SETUP ===
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  Serial.println(F("=== Rocket Nav Simulator (PID + Dynamics) ==="));
-  Serial.println(F("Commands (type + NL):"));
-  Serial.println(F("  MODE AUTO       → autonomous PID"));
-  Serial.println(F("  MODE MAN        → manual joystick"));
-  Serial.println(F("  SET <x> <y> <z> → set waypoint (meters)"));
-  Serial.println(F("  ABORT           → pause simulation"));
-  Serial.println(F("-----------------------------------------"));
-  Serial.println(F("Manual: joystick on A4 = X (yaw), A5 = Y (pitch)"));
+  delay(200);
+  Serial.println("=== Rocket Controller Starting ===");
 
   // Attach servos
-  servoPF.attach(PIN_SERVO_PF);
-  servoPB.attach(PIN_SERVO_PB);
-  servoYL.attach(PIN_SERVO_YL);
-  servoYR.attach(PIN_SERVO_YR);
-  centerFins();
+  finFront.attach(PIN_SERVO_FRONT);
+  finRight.attach(PIN_SERVO_RIGHT);
+  finBack.attach(PIN_SERVO_BACK);
+  finLeft.attach(PIN_SERVO_LEFT);
 
-  // Initialize states
-  posX = posY = posZ = 0.0f;
-  pitchAngle = yawAngle = 0.0f;
-  pitchRate = yawRate = 0.0f;
-  defPitch = defYaw = 0.0f;
-  globalMinDist = 1e9;
+  // Center fins
+  setAllFins(0, 0, 0, 0);
+
+  lastUpdateMillis = millis();
+  lastPrintMillis  = millis();
 }
 
+// === MAIN LOOP ===
 void loop() {
   handleSerial();
-  if (aborted) return;
 
-  if (manualMode) {
-    manualStep();
-  } else {
-    autonomousPIDStep();
+  if (mode == "MAN") {
+    manualModeLoop();
   }
-
-  simulateDynamics();
-  updateClosest();
-
-  // Report position and debug every second
-  if (++loopCounter >= LOOPS_PER_SEC) {
-    loopCounter = 0;
-    reportPosition();
+  else if (mode == "AUTO") {
+    autoModeLoop();
   }
-
-  delay(int(LOOP_DT * 1000));
+  else {
+    // Idle until “MAN” or “AUTO” entered
+  }
 }
 
-// ——— Helpers ———
-
-void centerFins() {
-  servoPF.write(90);
-  servoPB.write(90);
-  servoYL.write(90);
-  servoYR.write(90);
-  defPitch = defYaw = 0.0f;
-  Serial.println(F("→ Fins centered (90° each)"));
-}
-
+// === SERIAL HANDLING ===
 void handleSerial() {
-  if (!Serial.available()) return;
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();  // strip leading/trailing whitespace
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
 
-  // 1) Switch to Autonomous PID mode:
-  if (cmd.equalsIgnoreCase("MODE AUTO")) {
-    manualMode = false;
-    aborted    = false;
-
-    // Reset all kinematic & PID state:
-    posX = posY = posZ = 0.0f;
-    pitchAngle = yawAngle = 0.0f;
-    pitchRate  = yawRate  = 0.0f;
-    defPitch   = defYaw   = 0.0f;
-    globalMinDist   = 1e9;
-    waypointSet     = false;
-    pitchErrorPrev  = pitchErrorI = 0.0f;
-    yawErrorPrev    = yawErrorI   = 0.0f;
-
-    Serial.println(F("→ Switched to AUTONOMOUS PID; position/orientation reset to 0"));
-    Serial.println(F("   (Now type: SET <x> <y> <z> to define waypoint in meters)"));
-    centerFins();
-  }
-
-  // 2) Switch to Manual joystick mode:
-  else if (cmd.equalsIgnoreCase("MODE MAN")) {
-    manualMode = true;
-    aborted    = false;
-
-    // Reset all kinematic & PID state:
-    posX = posY = posZ = 0.0f;
-    pitchAngle = yawAngle = 0.0f;
-    pitchRate  = yawRate  = 0.0f;
-    defPitch   = defYaw   = 0.0f;
-    globalMinDist   = 1e9;
-    pitchErrorPrev  = pitchErrorI = 0.0f;
-    yawErrorPrev    = yawErrorI   = 0.0f;
-
-    Serial.println(F("→ Switched to MANUAL joystick; position/orientation reset to 0"));
-    centerFins();
-  }
-
-  // 3) SET command (expects exactly “SET <float> <float> <float>”):
-  else if (cmd.startsWith("SET ")) {
-    float x, y, z;
-    // Try to parse three floats from the entire command string:
-    if (sscanf(cmd.c_str(), "SET %f %f %f", &x, &y, &z) == 3) {
-      tx = x; ty = y; tz = z;
-      waypointSet = true;
-      globalMinDist = 1e9;
-
-      // Reset PID integrators:
-      pitchErrorI = pitchErrorPrev = 0.0f;
-      yawErrorI   = yawErrorPrev   = 0.0f;
-
-      Serial.print(F("→ Waypoint set to ("));
-      Serial.print(tx,2); Serial.print(F(", "));
-      Serial.print(ty,2); Serial.print(F(", "));
-      Serial.print(tz,2); Serial.println(F(") meters"));
-    } else {
-      Serial.println(F("! Invalid SET syntax (use: SET x y z)"));
+    if (input.equalsIgnoreCase("MAN")) {
+      if (mode != "MAN") {
+        mode = "MAN";
+        enterManualMode();
+      }
+    }
+    else if (input.equalsIgnoreCase("AUTO")) {
+      if (mode != "AUTO") {
+        mode = "AUTO";
+        enterAutoMode();
+      }
+    }
+    else if (mode == "AUTO" && !autoParamsSet) {
+      // Collect waypoint X, then Y, then Z
+      float val = input.toFloat();
+      bool valid = false;
+      if (autoInputStage == 0) {
+        waypointX = val;
+        valid = true;
+      }
+      else if (autoInputStage == 1) {
+        waypointY = val;
+        valid = true;
+      }
+      else if (autoInputStage == 2) {
+        waypointZ = val;
+        valid = true;
+      }
+      if (valid) {
+        autoInputStage++;
+        if (autoInputStage == 1) {
+          Serial.print("Waypoint X = "); Serial.println(waypointX,2);
+          Serial.println("Enter waypoint Y:");
+          Serial.print("> ");
+        }
+        else if (autoInputStage == 2) {
+          Serial.print("Waypoint Y = "); Serial.println(waypointY,2);
+          Serial.println("Enter waypoint Z:");
+          Serial.print("> ");
+        }
+        else if (autoInputStage == 3) {
+          Serial.print("Waypoint Z = "); Serial.println(waypointZ,2);
+          autoParamsSet = true;
+          Serial.println("Waypoint set. Starting AUTO...");
+          // Initialize launch state
+          if (!isLaunched) {
+            isLaunched = true;
+            launchMillis = millis();
+            lastUpdateMillis = millis();
+            posX = posY = posZ = 0;
+            velX = velY = velZ = 0;
+            pitchDeg = yawDeg = rollDeg = 0;
+            pitchRate = yawRate = rollRate = 0;
+          }
+        }
+      }
+      else {
+        Serial.println("Invalid number. Please re-enter:");
+        if (autoInputStage == 0) Serial.println("Enter waypoint X:");
+        else if (autoInputStage == 1) Serial.println("Enter waypoint Y:");
+        else if (autoInputStage == 2) Serial.println("Enter waypoint Z:");
+        Serial.print("> ");
+      }
     }
   }
+}
 
-  // 4) Abort:
-  else if (cmd.equalsIgnoreCase("ABORT")) {
-    aborted = true;
-    Serial.println(F("→ ABORTED: simulation paused. Type MODE AUTO or MODE MAN to restart."));
-    centerFins();
+// === MODE SWITCH ===
+void enterManualMode() {
+  Serial.println("MODE: MANUAL");
+  mode = "MAN";
+  autoParamsSet = false;
+  autoInputStage = 0;
+  isLaunched = false;
+  Serial.println("Use joystick (A4 pitch, A5 yaw) to move fins.");
+}
+
+void enterAutoMode() {
+  Serial.println("MODE: AUTO");
+  mode = "AUTO";
+  autoParamsSet = false;
+  autoInputStage = 0;
+  isLaunched = false;
+  Serial.println("Enter waypoint X:");
+  Serial.print("> ");
+}
+
+// === MANUAL MODE ===
+void manualModeLoop() {
+  // Read joystick 0..1023
+  int rawPitch = analogRead(PIN_JOYSTICK_PITCH);
+  int rawYaw   = analogRead(PIN_JOYSTICK_YAW);
+
+  // Map to ±FIN_ANGLE_MAX
+  float pitchDef = mapJoystickToAngle(rawPitch);
+  float yawDef   = mapJoystickToAngle(rawYaw);
+
+  // Assign fins: front/back for pitch, right/left for yaw
+  float finFrontDeg = pitchDef;  
+  float finBackDeg  = -pitchDef;
+  float finRightDeg = yawDef;
+  float finLeftDeg  = -yawDef;
+
+  setAllFins(finFrontDeg, finRightDeg, finBackDeg, finLeftDeg);
+
+  // Update simulated attitude (or real IMU) 
+  unsigned long now = millis();
+  float dt = (now - lastUpdateMillis) * 1e-3;
+  lastUpdateMillis = now;
+  computeAttitudeFromIMU(dt);
+
+  // Print every 500 ms
+  if (now - lastPrintMillis >= 500) {
+    lastPrintMillis = now;
+    Serial.print("MANUAL | ATT°: P=");
+    Serial.print(pitchDeg,1);
+    Serial.print(" Y=");
+    Serial.print(yawDeg,1);
+    Serial.print(" R=");
+    Serial.println(rollDeg,1);
   }
-}
-void manualStep() {
-  // Read joystick (0–1023)
-  int rawX = analogRead(PIN_JOYSTICK_X);
-  int rawY = analogRead(PIN_JOYSTICK_Y);
-  const float CENTER = 512.0f;
-  float normX = (rawX - CENTER) / CENTER;  // -1..+1 for yaw
-  float normY = (CENTER - rawY) / CENTER;  // -1..+1 for pitch (inverted)
-  defYaw   = constrain(normX * MAX_DEFLECT, -MAX_DEFLECT, +MAX_DEFLECT);
-  defPitch = constrain(normY * MAX_DEFLECT, -MAX_DEFLECT, +MAX_DEFLECT);
-  applyFins(defPitch, defYaw);
+  delay(10);
 }
 
-void autonomousPIDStep() {
-  if (!waypointSet) {
-    centerFins();
+// === AUTO MODE ===
+void autoModeLoop() {
+  unsigned long now = millis();
+  float dt = (now - lastUpdateMillis) * 1e-3;
+  lastUpdateMillis = now;
+
+  if (!autoParamsSet) {
+    // Still waiting for X, Y, Z
     return;
   }
 
-  // Compute error components
-  float ex = tx - posX;
-  float ey = ty - posY;
-  float ez = tz - posZ;
-  float dist = sqrt(ex*ex + ey*ey + ez*ez);
+  // 1) Compute 3D error
+  float dX = waypointX - posX;
+  float dY = waypointY - posY;
+  float dZ = waypointZ - posZ;
+  float dist3D = sqrt(dX*dX + dY*dY + dZ*dZ);
 
-  if (dist < 0.5f) {
-    // Close enough: center fins and stop
-    centerFins();
+  // 2) Check if within tolerance
+  if (dist3D <= WAYPOINT_TOL) {
+    setAllFins(0, 0, 0, 0);
+    Serial.println("Waypoint reached!");
+    mode = ""; 
+    isLaunched = false;
+    autoParamsSet = false;
+    Serial.println("Enter 'MAN' or 'AUTO' to continue.");
     return;
   }
 
-  // Desired angles (deg):
-  //  - pitch: positive means target is ahead in X direction relative to Z
-  //  - yaw:   positive means target is to the right in Y direction relative to Z
-  float desiredPitch = atan2(ex, ez) * 180.0f / PI;
-  float desiredYaw   = atan2(ey, ez) * 180.0f / PI;
+  // 3) Desired direction: point body axis at waypoint
+  float distXY = sqrt(dX*dX + dY*dY) + 1e-6;
+  float desiredPitch = atan2(dZ, distXY) * 180.0 / PI;
+  float desiredYaw   = atan2(dY, dX)   * 180.0 / PI;
 
-  // PID for pitch
-  float currentPitchDeg = pitchAngle * 180.0f / PI;
-  float errorPitch = desiredPitch - currentPitchDeg;
-  pitchErrorI += errorPitch * LOOP_DT;
-  float dErrorPitch = (errorPitch - pitchErrorPrev) / LOOP_DT;
-  float outPitch = KP_PITCH * errorPitch + KI_PITCH * pitchErrorI + KD_PITCH * dErrorPitch;
-  pitchErrorPrev = errorPitch;
+  float errPitch = desiredPitch - pitchDeg;
+  float errYaw   = desiredYaw   - yawDeg;
+  if (errYaw > 180)  errYaw -= 360;
+  if (errYaw < -180) errYaw += 360;
 
-  // PID for yaw
-  float currentYawDeg = yawAngle * 180.0f / PI;
-  float errorYaw = desiredYaw - currentYawDeg;
-  yawErrorI += errorYaw * LOOP_DT;
-  float dErrorYaw = (errorYaw - yawErrorPrev) / LOOP_DT;
-  float outYaw = KP_YAW * errorYaw + KI_YAW * yawErrorI + KD_YAW * dErrorYaw;
-  yawErrorPrev = errorYaw;
+  // 4) PD for pitch
+  float pitchErrorDerivative = -pitchRate;
+  float pitchAcc = Kp_pitch * errPitch + Kd_pitch * pitchErrorDerivative;
+  pitchRate += pitchAcc * dt;
+  pitchDeg += pitchRate * dt;
 
-  // Constrain to max deflection
-  defPitch = constrain(outPitch, -MAX_DEFLECT, +MAX_DEFLECT);
-  defYaw   = constrain(outYaw,   -MAX_DEFLECT, +MAX_DEFLECT);
+  // 5) PD for yaw
+  float yawErrorDerivative = -yawRate;
+  float yawAcc = Kp_yaw * errYaw + Kd_yaw * yawErrorDerivative;
+  yawRate += yawAcc * dt;
+  yawDeg += yawRate * dt;
 
-  // Print debug once every second
-  if (loopCounter == 0) {
-    Serial.print(F("→ PID errs: P="));
-    Serial.print(errorPitch,2);
-    Serial.print(F("°, Y="));
-    Serial.print(errorYaw,2);
-    Serial.print(F("° | defl: P="));
-    Serial.print(defPitch,2);
-    Serial.print(F("°, Y="));
-    Serial.print(defYaw,2);
-    Serial.println(F("°"));
+  // 6) Residual error
+  float errPitch2 = desiredPitch - pitchDeg;
+  float errYaw2   = desiredYaw - yawDeg;
+  if (errYaw2 > 180)  errYaw2 -= 360;
+  if (errYaw2 < -180) errYaw2 += 360;
+
+  // 7) Fin commands
+  float finPitchCmd = constrain(errPitch2 * 0.5, -FIN_ANGLE_MAX, FIN_ANGLE_MAX);
+  float finYawCmd   = constrain(errYaw2   * 0.5, -FIN_ANGLE_MAX, FIN_ANGLE_MAX);
+
+  float frontCmd = finPitchCmd;
+  float backCmd  = -finPitchCmd;
+  float rightCmd = finYawCmd;
+  float leftCmd  = -finYawCmd;
+
+  // 8) Smooth deflections
+  static float filtFront=0, filtBack=0, filtRight=0, filtLeft=0;
+  const float alpha = 0.02;
+  filtFront = filtFront + alpha * (frontCmd - filtFront);
+  filtBack  = filtBack  + alpha * (backCmd  - filtBack);
+  filtRight = filtRight + alpha * (rightCmd - filtRight);
+  filtLeft  = filtLeft  + alpha * (leftCmd  - filtLeft);
+
+  setAllFins(filtFront, filtRight, filtBack, filtLeft);
+
+  // 9) Update physics with strong constant thrust
+  updateRocketPhysics(dt);
+
+  // 10) Print every 500 ms
+  if (now - lastPrintMillis >= 500) {
+    lastPrintMillis = now;
+    Serial.print("AUTO | POS(m)=(");
+    Serial.print(posX,1); Serial.print(",");
+    Serial.print(posY,1); Serial.print(",");
+    Serial.print(posZ,1); Serial.print(") ");
+    Serial.print("DistToWP="); Serial.print(dist3D,1); Serial.print("m ");
+    Serial.print("| Fins=(P:"); Serial.print(filtFront,1);
+    Serial.print(",Y:"); Serial.print(filtRight,1);
+    Serial.print(","); Serial.print(filtBack,1);
+    Serial.print(","); Serial.print(filtLeft,1);
+    Serial.println(")");
   }
 
-  applyFins(defPitch, defYaw);
+  delay(10);
 }
 
-void applyFins(float dp, float dy) {
-  int pf = constrain(90 - dp, 0, 180);
-  int pb = constrain(90 + dp, 0, 180);
-  int yl = constrain(90 - dy, 0, 180);
-  int yr = constrain(90 + dy, 0, 180);
-  servoPF.write(pf);
-  servoPB.write(pb);
-  servoYL.write(yl);
-  servoYR.write(yr);
-
-  // Print servo angles once every second
-  if (loopCounter == 0) {
-    Serial.print(F("→ Servo angles PF,PB,YL,YR = "));
-    Serial.print(pf); Serial.print(F(", "));
-    Serial.print(pb); Serial.print(F(", "));
-    Serial.print(yl); Serial.print(F(", "));
-    Serial.println(yr);
+// === UPDATE ROCKET PHYSICS ===
+void updateRocketPhysics(float dt) {
+  if (!isLaunched) {
+    // First time in AUTO (after waypoint set)
+    isLaunched = true;
+    launchMillis = millis();
+    posX = posY = posZ = 0;
+    velX = velY = velZ = 0;
   }
+
+  // 1) Compute constant thrust = THRUST_FACTOR × weight
+  float thrust = MASS_TOTAL * GRAVITY * THRUST_FACTOR;
+
+  // 2) Decompose into inertial axes
+  float pitchRad = pitchDeg * PI / 180.0;
+  float yawRad   = yawDeg   * PI / 180.0;
+  float t_x = thrust * sin(pitchRad) * cos(yawRad);
+  float t_y = thrust * sin(pitchRad) * sin(yawRad);
+  float t_z = thrust * cos(pitchRad);
+
+  // 3) Compute drag magnitude
+  float dragMag = computeDragMagnitude(velX, velY, velZ);
+  float speed   = sqrt(velX*velX + velY*velY + velZ*velZ) + 1e-6;
+  float dragX = dragMag * (velX / speed);
+  float dragY = dragMag * (velY / speed);
+  float dragZ = dragMag * (velZ / speed);
+
+  // 4) Net forces
+  float FnetX = t_x - dragX;
+  float FnetY = t_y - dragY;
+  float FnetZ = t_z - (MASS_TOTAL * GRAVITY) - dragZ;
+
+  // 5) Accelerations
+  accX = FnetX / MASS_TOTAL;
+  accY = FnetY / MASS_TOTAL;
+  accZ = FnetZ / MASS_TOTAL;
+
+  // 6) Update velocities
+  velX += accX * dt;
+  velY += accY * dt;
+  velZ += accZ * dt;
+
+  // 7) Update positions
+  posX += velX * dt;
+  posY += velY * dt;
+  posZ += velZ * dt;
 }
 
-void simulateDynamics() {
-  // Convert commanded deflections to radians for torque calc
-  float defPitchRad = defPitch * PI / 180.0f;
-  float defYawRad   = defYaw   * PI / 180.0f;
-
-  // Angular accelerations (α = torque / I; torque ~ K_TORQUE * deflectionRad)
-  float pitchAcc = (K_TORQUE * defPitchRad) / I_MOMENT;
-  float yawAcc   = (K_TORQUE * defYawRad)   / I_MOMENT;
-
-  // Integrate angular rates and angles
-  pitchRate += pitchAcc * LOOP_DT;
-  yawRate   += yawAcc   * LOOP_DT;
-  pitchAngle += pitchRate * LOOP_DT;
-  yawAngle   += yawRate   * LOOP_DT;
-
-  // Compute unit direction vector from orientation
-  float ux = sin(pitchAngle);                    // tilt from +Z into +X
-  float uy = sin(yawAngle);                      // tilt from +Z into +Y
-  float uz = cos(pitchAngle) * cos(yawAngle);    // forward component
-
-  // Update position along that direction
-  posX += ux * SPEED * LOOP_DT;
-  posY += uy * SPEED * LOOP_DT;
-  posZ += uz * SPEED * LOOP_DT;
+// === COMPUTE DRAG MAGNITUDE ===
+float computeDragMagnitude(float vx, float vy, float vz) {
+  float speed = sqrt(vx*vx + vy*vy + vz*vz);
+  return 0.5 * AIR_DENSITY * speed * speed * AREA_ROCKET * CD_ROCKET;
 }
 
-void updateClosest() {
-  if (!waypointSet) return;
-  float dx = tx - posX;
-  float dy = ty - posY;
-  float dz = tz - posZ;
-  float d  = sqrt(dx*dx + dy*dy + dz*dz);
-  if (d < globalMinDist) {
-    globalMinDist = d;
-    Serial.print(F("🏁 New closest: "));
-    Serial.print(d,2);
-    Serial.print(F(" m at POS("));
-    Serial.print(posX,2); Serial.print(F(", "));
-    Serial.print(posY,2); Serial.print(F(", "));
-    Serial.print(posZ,2); Serial.println(F(")"));
-  }
+// === STUB: ATTITUDE FROM IMU ===
+void computeAttitudeFromIMU(float dt) {
+  // If you have a real IMU/MPU6050, insert fusion code here to update:
+  //   pitchDeg, yawDeg, rollDeg, pitchRate, yawRate, rollRate.
+  // Otherwise, attitude is updated in autoModeLoop().
 }
 
-void reportPosition() {
-  Serial.print(F("POS("));
-  Serial.print(posX,2); Serial.print(F(", "));
-  Serial.print(posY,2); Serial.print(F(", "));
-  Serial.print(posZ,2); Serial.println(F(") m"));
+// === SET ALL FINS ===
+void setAllFins(float frontDeg, float rightDeg, float backDeg, float leftDeg) {
+  int pwmFront = SERVO_CENTER + (frontDeg / FIN_ANGLE_MAX) * (SERVO_RANGE / 2);
+  int pwmBack  = SERVO_CENTER + (backDeg  / FIN_ANGLE_MAX) * (SERVO_RANGE / 2);
+  int pwmRight = SERVO_CENTER + (rightDeg / FIN_ANGLE_MAX) * (SERVO_RANGE / 2);
+  int pwmLeft  = SERVO_CENTER + (leftDeg  / FIN_ANGLE_MAX) * (SERVO_RANGE / 2);
+
+  pwmFront = constrain(pwmFront,  SERVO_CENTER - SERVO_RANGE/2, SERVO_CENTER + SERVO_RANGE/2);
+  pwmBack  = constrain(pwmBack,   SERVO_CENTER - SERVO_RANGE/2, SERVO_CENTER + SERVO_RANGE/2);
+  pwmRight = constrain(pwmRight,  SERVO_CENTER - SERVO_RANGE/2, SERVO_CENTER + SERVO_RANGE/2);
+  pwmLeft  = constrain(pwmLeft,   SERVO_CENTER - SERVO_RANGE/2, SERVO_CENTER + SERVO_RANGE/2);
+
+  finFront.write(pwmFront);
+  finRight.write(pwmRight);
+  finBack.write(pwmBack);
+  finLeft.write(pwmLeft);
+}
+
+// === MAP JOYSTICK READING TO ±FIN_ANGLE_MAX ===
+float mapJoystickToAngle(int reading) {
+  float norm = (reading - 512.0) / 512.0;  // -1..+1
+  if (norm > 1.0) norm = 1.0;
+  if (norm < -1.0) norm = -1.0;
+  return norm * FIN_ANGLE_MAX;
 }
