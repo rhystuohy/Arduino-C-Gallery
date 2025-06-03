@@ -1,23 +1,3 @@
-/*
-  Rocket Controller with JOYSTICK Manual Mode + AUTO (Waypoint) Mode
-  – Revised to ensure equal prioritization of X, Y, and Z:
-    • In AUTO mode, thrust is set high enough to overcome gravity continually
-      until the waypoint is reached (ignores fuel depletion).
-    • Uses a PD controller that points the rocket’s body axis directly at (X,Y,Z).
-    • Stops all motion and prints “Waypoint reached!” once within tolerance in 3D,
-      then waits for next “MAN” or “AUTO” command.
-    • Serial output every 500 ms.
-    • Servos:
-        Front → pin 3
-        Right → pin 9
-        Back  → pin 6
-        Left  → pin 5
-    • Joystick in MAN mode:
-        Pitch → A4
-        Yaw   → A5
-
-  Author: Combined & revised 2025-06-03
-*/
 
 #include <Servo.h>
 #include <Wire.h>
@@ -26,55 +6,48 @@
 
 // === PIN ASSIGNMENTS ===
 const int PIN_SERVO_FRONT = 3;
-const int PIN_SERVO_RIGHT = 5;   // swapped
+const int PIN_SERVO_RIGHT = 5;
 const int PIN_SERVO_BACK  = 9;
-const int PIN_SERVO_LEFT  = 6;   // swapped
+const int PIN_SERVO_LEFT  = 6;
 
 const int PIN_JOYSTICK_PITCH = A4;  // vertical axis
 const int PIN_JOYSTICK_YAW   = A5;  // horizontal axis
 
 // === CONSTANTS ===
-const float FIN_ANGLE_MAX  = 30.0;    // degrees
-const int   SERVO_CENTER   = 90;      // center PWM
-const int   SERVO_RANGE    = 60;      // ±30° span
+const float FIN_ANGLE_MAX   = 30.0f;   // degrees
+const int   SERVO_CENTER    = 90;      // center PWM
+const int   SERVO_RANGE     = 60;      // ±30° span
 
-const float MASS_TOTAL     = 20.0;    // kg (payload + “sufficient fuel”)
-const float THRUST_FACTOR  = 1.5;     // multiplier so thrust = 1.5 × weight
-
-const float GRAVITY        = 9.81;    // m/s²
-
-const float AIR_DENSITY    = 1.2;     // kg/m³
-const float AREA_ROCKET    = 0.1;     // m² (approx cross-sectional)
-const float CD_ROCKET      = 0.75;    // drag coefficient
-
-const float WAYPOINT_TOL   = 2.0;     // meters tolerance for “reached”
+const float ACC_MAGNITUDE   = 2.0f;    // m/s² along body‐axis (always)
+const float WAYPOINT_TOL    = 2.0f;    // meters tolerance for “reached”
 
 // PD gains (tune if needed)
-const float Kp_pitch = 2.0;    // deg/s² per degree error
-const float Kd_pitch = 0.8;    // damping term
-const float Kp_yaw   = 2.0;
-const float Kd_yaw   = 0.8;
+const float Kp_pitch = 2.0f;    // deg/s² per deg error
+const float Kd_pitch = 0.8f;    // damping
+const float Kp_yaw   = 2.0f;
+const float Kd_yaw   = 0.8f;
 
 // === GLOBAL VARIABLES ===
 Servo finFront, finRight, finBack, finLeft;
 
-String mode = "MAN";      // “MAN” or “AUTO”
-bool isLaunched    = false;
-bool autoParamsSet = false;
-int  autoInputStage= 0;   // 0=X, 1=Y, 2=Z, 3=done
+String mode = "";            // "", "MAN", or "AUTO"
+bool isLaunched     = false;
+bool autoParamsSet  = false;
+int  autoInputStage = 0;     // 0 = X, 1 = Y, 2 = Z, 3 = ready
 
 unsigned long launchMillis     = 0;
 unsigned long lastUpdateMillis = 0;
 unsigned long lastPrintMillis  = 0;
 
-float posX = 0, posY = 0, posZ = 0;   // inertial position (m)
-float velX = 0, velY = 0, velZ = 0;   // inertial velocity (m/s)
-float accX = 0, accY = 0, accZ = 0;   // inertial acceleration (m/s²)
+float posX = 0, posY = 0, posZ = 0;   // m
+float velX = 0, velY = 0, velZ = 0;   // m/s
+float accX = 0, accY = 0, accZ = 0;   // m/s²
 
-float pitchDeg = 0, yawDeg = 0, rollDeg = 0;    // orientation (deg)
-float pitchRate = 0, yawRate = 0, rollRate = 0; // angular rates (deg/s)
+float pitchDeg = 0, yawDeg = 0, rollDeg = 0;    // deg
+float pitchRate = 0, yawRate = 0, rollRate = 0; // deg/s
 
 float waypointX = 0, waypointY = 0, waypointZ = 0;
+float prevDist3D = 1e6f;   // track distance for closest‐approach logic
 
 // === FUNCTION DECLARATIONS ===
 void setup();
@@ -85,8 +58,7 @@ void enterAutoMode();
 void manualModeLoop();
 void autoModeLoop();
 void updateRocketPhysics(float dt);
-float computeDragMagnitude(float vx, float vy, float vz);
-void computeAttitudeFromIMU(float dt);  // stub or IMU fusion
+void computeAttitudeFromIMU(float dt);  // stub
 void setAllFins(float frontDeg, float rightDeg, float backDeg, float leftDeg);
 float mapJoystickToAngle(int reading);
 
@@ -120,208 +92,251 @@ void loop() {
     autoModeLoop();
   }
   else {
-    // Idle until “MAN” or “AUTO” entered
+    // Idle until “MAN” or “AUTO” is entered
   }
 }
 
 // === SERIAL HANDLING ===
 void handleSerial() {
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
+  if (!Serial.available()) return;
 
-    if (input.equalsIgnoreCase("MAN")) {
-      if (mode != "MAN") {
-        mode = "MAN";
-        enterManualMode();
-      }
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+
+  // In MAN mode, “ABORT” stops motion and returns to idle
+  if (mode == "MAN" && input.equalsIgnoreCase("ABORT")) {
+    setAllFins(0, 0, 0, 0);
+    Serial.println("Manual ABORT. Waiting for 'MAN' or 'AUTO'.");
+    mode = "";
+    isLaunched = false;
+    return;
+  }
+
+  // Enter MANUAL
+  if (input.equalsIgnoreCase("MAN")) {
+    mode = "MAN";
+    enterManualMode();
+    return;
+  }
+
+  // Enter AUTO
+  if (input.equalsIgnoreCase("AUTO")) {
+    mode = "AUTO";
+    enterAutoMode();
+    return;
+  }
+
+  // In AUTO, parse waypoint X, Y, Z in sequence
+  if (mode == "AUTO" && !autoParamsSet) {
+    float val = input.toFloat();
+    bool valid = false;
+    if (autoInputStage == 0) {
+      waypointX = val;
+      valid = true;
     }
-    else if (input.equalsIgnoreCase("AUTO")) {
-      if (mode != "AUTO") {
-        mode = "AUTO";
-        enterAutoMode();
-      }
+    else if (autoInputStage == 1) {
+      waypointY = val;
+      valid = true;
     }
-    else if (mode == "AUTO" && !autoParamsSet) {
-      // Collect waypoint X, then Y, then Z
-      float val = input.toFloat();
-      bool valid = false;
-      if (autoInputStage == 0) {
-        waypointX = val;
-        valid = true;
-      }
-      else if (autoInputStage == 1) {
-        waypointY = val;
-        valid = true;
-      }
-      else if (autoInputStage == 2) {
-        waypointZ = val;
-        valid = true;
-      }
-      if (valid) {
-        autoInputStage++;
-        if (autoInputStage == 1) {
-          Serial.print("Waypoint X = "); Serial.println(waypointX,2);
-          Serial.println("Enter waypoint Y:");
-          Serial.print("> ");
-        }
-        else if (autoInputStage == 2) {
-          Serial.print("Waypoint Y = "); Serial.println(waypointY,2);
-          Serial.println("Enter waypoint Z:");
-          Serial.print("> ");
-        }
-        else if (autoInputStage == 3) {
-          Serial.print("Waypoint Z = "); Serial.println(waypointZ,2);
-          autoParamsSet = true;
-          Serial.println("Waypoint set. Starting AUTO...");
-          // Initialize launch state
-          if (!isLaunched) {
-            isLaunched = true;
-            launchMillis = millis();
-            lastUpdateMillis = millis();
-            posX = posY = posZ = 0;
-            velX = velY = velZ = 0;
-            pitchDeg = yawDeg = rollDeg = 0;
-            pitchRate = yawRate = rollRate = 0;
-          }
-        }
-      }
-      else {
-        Serial.println("Invalid number. Please re-enter:");
-        if (autoInputStage == 0) Serial.println("Enter waypoint X:");
-        else if (autoInputStage == 1) Serial.println("Enter waypoint Y:");
-        else if (autoInputStage == 2) Serial.println("Enter waypoint Z:");
+    else if (autoInputStage == 2) {
+      waypointZ = val;
+      valid = true;
+    }
+    if (valid) {
+      autoInputStage++;
+      if (autoInputStage == 1) {
+        Serial.print("Waypoint X = "); Serial.println(waypointX, 2);
+        Serial.println("Enter waypoint Y:");
         Serial.print("> ");
       }
+      else if (autoInputStage == 2) {
+        Serial.print("Waypoint Y = "); Serial.println(waypointY, 2);
+        Serial.println("Enter waypoint Z:");
+        Serial.print("> ");
+      }
+      else if (autoInputStage == 3) {
+        Serial.print("Waypoint Z = "); Serial.println(waypointZ, 2);
+        autoParamsSet = true;
+        Serial.println("Waypoint set. Starting AUTO...");
+        // Initialize for AUTO
+        isLaunched = false;  
+        prevDist3D = 1e6f;
+        posX = posY = posZ = 0;
+        velX = velY = velZ = 0;
+        pitchDeg = yawDeg = rollDeg = 0;
+        pitchRate = yawRate = rollRate = 0;
+      }
+    }
+    else {
+      Serial.println("Invalid number. Please re-enter:");
+      if (autoInputStage == 0) {
+        Serial.println("Enter waypoint X:");
+      } else if (autoInputStage == 1) {
+        Serial.println("Enter waypoint Y:");
+      } else if (autoInputStage == 2) {
+        Serial.println("Enter waypoint Z:");
+      }
+      Serial.print("> ");
     }
   }
 }
 
-// === MODE SWITCH ===
+// === MODE SWITCH ROUTINES ===
 void enterManualMode() {
-  Serial.println("MODE: MANUAL");
+  Serial.println("===== MANUAL MODE =====");
+  Serial.println("Type 'ABORT' to exit manual mode.");
   mode = "MAN";
   autoParamsSet = false;
   autoInputStage = 0;
   isLaunched = false;
-  Serial.println("Use joystick (A4 pitch, A5 yaw) to move fins.");
 }
 
 void enterAutoMode() {
-  Serial.println("MODE: AUTO");
+  Serial.println("===== AUTO MODE =====");
   mode = "AUTO";
   autoParamsSet = false;
   autoInputStage = 0;
-  isLaunched = false;
   Serial.println("Enter waypoint X:");
   Serial.print("> ");
 }
 
 // === MANUAL MODE ===
 void manualModeLoop() {
-  // Read joystick 0..1023
+  // 1) Read joystick (0–1023)
   int rawPitch = analogRead(PIN_JOYSTICK_PITCH);
   int rawYaw   = analogRead(PIN_JOYSTICK_YAW);
 
-  // Map to ±FIN_ANGLE_MAX
+  // 2) Map to ±FIN_ANGLE_MAX
   float pitchDef = mapJoystickToAngle(rawPitch);
   float yawDef   = mapJoystickToAngle(rawYaw);
 
-  // Assign fins: front/back for pitch, right/left for yaw
-  float finFrontDeg = pitchDef;  
+  // 3) Compute fins: front/back = pitch, right/left = yaw
+  float finFrontDeg = pitchDef;
   float finBackDeg  = -pitchDef;
   float finRightDeg = yawDef;
   float finLeftDeg  = -yawDef;
 
   setAllFins(finFrontDeg, finRightDeg, finBackDeg, finLeftDeg);
 
-  // Update simulated attitude (or real IMU) 
+  // 4) Update attitude stub (or IMU if available)
   unsigned long now = millis();
-  float dt = (now - lastUpdateMillis) * 1e-3;
+  float dt = (now - lastUpdateMillis) * 1e-3f;
   lastUpdateMillis = now;
   computeAttitudeFromIMU(dt);
 
-  // Print every 500 ms
-  if (now - lastPrintMillis >= 500) {
+  // 5) Even in MANUAL, we still “accelerate” 2 m/s² along body axis
+  updateRocketPhysics(dt);
+
+  // 6) Print (X,Y,Z) and attitude every 250 ms
+  if (now - lastPrintMillis >= 250) {
     lastPrintMillis = now;
-    Serial.print("MANUAL | ATT°: P=");
-    Serial.print(pitchDeg,1);
-    Serial.print(" Y=");
-    Serial.print(yawDeg,1);
-    Serial.print(" R=");
-    Serial.println(rollDeg,1);
+    Serial.print("MANUAL | POS(m)=(");
+    Serial.print(posX,  2); Serial.print(",");
+    Serial.print(posY,  2); Serial.print(",");
+    Serial.print(posZ,  2); Serial.print(") ");
+    Serial.print("ATT°=P:");
+    Serial.print(pitchDeg, 1); Serial.print(" Y:");
+    Serial.print(yawDeg,   1); Serial.print(" R:");
+    Serial.println(rollDeg, 1);
   }
+
   delay(10);
 }
 
 // === AUTO MODE ===
 void autoModeLoop() {
   unsigned long now = millis();
-  float dt = (now - lastUpdateMillis) * 1e-3;
+  float dt = (now - lastUpdateMillis) * 1e-3f;
   lastUpdateMillis = now;
 
   if (!autoParamsSet) {
-    // Still waiting for X, Y, Z
+    // Still waiting for user to enter X, Y, Z
     return;
   }
 
-  // 1) Compute 3D error
+  // 1) Initialize on first AUTO call
+  if (!isLaunched) {
+    isLaunched = true;
+    launchMillis = millis();
+    posX = posY = posZ = 0;
+    velX = velY = velZ = 0;
+    pitchDeg = yawDeg = rollDeg = 0;
+    pitchRate = yawRate = rollRate = 0;
+    prevDist3D = 1e6f;
+  }
+
+  // 2) Compute 3D error to waypoint
   float dX = waypointX - posX;
   float dY = waypointY - posY;
   float dZ = waypointZ - posZ;
   float dist3D = sqrt(dX*dX + dY*dY + dZ*dZ);
 
-  // 2) Check if within tolerance
-  if (dist3D <= WAYPOINT_TOL) {
+  // 3) Track closest approach
+  static bool passedClosest = false;
+  if (dist3D < prevDist3D) {
+    prevDist3D = dist3D;
+    passedClosest = false;
+  } else if (!passedClosest && dist3D > prevDist3D) {
+    passedClosest = true;
+  }
+
+  // 4) If within tolerance or passed closest, stop
+  if (dist3D <= WAYPOINT_TOL || passedClosest) {
     setAllFins(0, 0, 0, 0);
-    Serial.println("Waypoint reached!");
-    mode = ""; 
+    Serial.print("Waypoint reached! Closest dist = ");
+    Serial.print(prevDist3D, 2);
+    Serial.print(" m at POS=(");
+    Serial.print(posX,  2); Serial.print(",");
+    Serial.print(posY,  2); Serial.print(",");
+    Serial.print(posZ,  2); Serial.println(")");
+    // Reset for next command
+    mode = "";
     isLaunched = false;
     autoParamsSet = false;
     Serial.println("Enter 'MAN' or 'AUTO' to continue.");
     return;
   }
 
-  // 3) Desired direction: point body axis at waypoint
-  float distXY = sqrt(dX*dX + dY*dY) + 1e-6;
-  float desiredPitch = atan2(dZ, distXY) * 180.0 / PI;
-  float desiredYaw   = atan2(dY, dX)   * 180.0 / PI;
+  // 5) Compute desired attitude toward waypoint
+  float distXY = sqrt(dX*dX + dY*dY) + 1e-6f;
+  float desiredPitch = atan2(dZ, distXY) * 180.0f / PI;
+  float desiredYaw   = atan2(dY, dX)   * 180.0f / PI;
 
   float errPitch = desiredPitch - pitchDeg;
   float errYaw   = desiredYaw   - yawDeg;
-  if (errYaw > 180)  errYaw -= 360;
-  if (errYaw < -180) errYaw += 360;
+  if (errYaw > 180.0f)  errYaw -= 360.0f;
+  if (errYaw < -180.0f) errYaw += 360.0f;
 
-  // 4) PD for pitch
+  // 6) PD control for pitch
   float pitchErrorDerivative = -pitchRate;
   float pitchAcc = Kp_pitch * errPitch + Kd_pitch * pitchErrorDerivative;
   pitchRate += pitchAcc * dt;
-  pitchDeg += pitchRate * dt;
+  pitchDeg  += pitchRate * dt;
 
-  // 5) PD for yaw
+  // 7) PD control for yaw
   float yawErrorDerivative = -yawRate;
   float yawAcc = Kp_yaw * errYaw + Kd_yaw * yawErrorDerivative;
   yawRate += yawAcc * dt;
-  yawDeg += yawRate * dt;
+  yawDeg  += yawRate * dt;
 
-  // 6) Residual error
+  // 8) Compute residual errors
   float errPitch2 = desiredPitch - pitchDeg;
-  float errYaw2   = desiredYaw - yawDeg;
-  if (errYaw2 > 180)  errYaw2 -= 360;
-  if (errYaw2 < -180) errYaw2 += 360;
+  float errYaw2   = desiredYaw   - yawDeg;
+  if (errYaw2 > 180.0f)  errYaw2 -= 360.0f;
+  if (errYaw2 < -180.0f) errYaw2 += 360.0f;
 
-  // 7) Fin commands
-  float finPitchCmd = constrain(errPitch2 * 0.5, -FIN_ANGLE_MAX, FIN_ANGLE_MAX);
-  float finYawCmd   = constrain(errYaw2   * 0.5, -FIN_ANGLE_MAX, FIN_ANGLE_MAX);
+  // 9) Fin deflections from residuals
+  float finPitchCmd = constrain(errPitch2 * 0.5f, -FIN_ANGLE_MAX, FIN_ANGLE_MAX);
+  float finYawCmd   = constrain(errYaw2   * 0.5f, -FIN_ANGLE_MAX, FIN_ANGLE_MAX);
 
   float frontCmd = finPitchCmd;
   float backCmd  = -finPitchCmd;
   float rightCmd = finYawCmd;
   float leftCmd  = -finYawCmd;
 
-  // 8) Smooth deflections
-  static float filtFront=0, filtBack=0, filtRight=0, filtLeft=0;
-  const float alpha = 0.02;
+  // 10) Smooth deflections
+  static float filtFront = 0, filtBack = 0, filtRight = 0, filtLeft = 0;
+  const float alpha = 0.02f;
   filtFront = filtFront + alpha * (frontCmd - filtFront);
   filtBack  = filtBack  + alpha * (backCmd  - filtBack);
   filtRight = filtRight + alpha * (rightCmd - filtRight);
@@ -329,22 +344,22 @@ void autoModeLoop() {
 
   setAllFins(filtFront, filtRight, filtBack, filtLeft);
 
-  // 9) Update physics with strong constant thrust
+  // 11) Update physics with constant 2 m/s² along body axis
   updateRocketPhysics(dt);
 
-  // 10) Print every 500 ms
-  if (now - lastPrintMillis >= 500) {
+  // 12) Print telemetry every 250 ms
+  if (now - lastPrintMillis >= 250) {
     lastPrintMillis = now;
     Serial.print("AUTO | POS(m)=(");
-    Serial.print(posX,1); Serial.print(",");
-    Serial.print(posY,1); Serial.print(",");
-    Serial.print(posZ,1); Serial.print(") ");
-    Serial.print("DistToWP="); Serial.print(dist3D,1); Serial.print("m ");
-    Serial.print("| Fins=(P:"); Serial.print(filtFront,1);
-    Serial.print(",Y:"); Serial.print(filtRight,1);
-    Serial.print(","); Serial.print(filtBack,1);
-    Serial.print(","); Serial.print(filtLeft,1);
-    Serial.println(")");
+    Serial.print(posX,  2); Serial.print(",");
+    Serial.print(posY,  2); Serial.print(",");
+    Serial.print(posZ,  2); Serial.print(") ");
+    Serial.print("Dist="); Serial.print(dist3D, 2); Serial.print("m ");
+    Serial.print("| Fins=(P:");
+    Serial.print(filtFront, 1); Serial.print(",Y:");
+    Serial.print(filtRight, 1); Serial.print(",");
+    Serial.print(filtBack,  1); Serial.print(",");
+    Serial.print(filtLeft,  1); Serial.println(")");
   }
 
   delay(10);
@@ -352,63 +367,35 @@ void autoModeLoop() {
 
 // === UPDATE ROCKET PHYSICS ===
 void updateRocketPhysics(float dt) {
-  if (!isLaunched) {
-    // First time in AUTO (after waypoint set)
-    isLaunched = true;
-    launchMillis = millis();
-    posX = posY = posZ = 0;
-    velX = velY = velZ = 0;
-  }
+  // Always accelerate 2 m/s² along body axis (defined by pitchDeg, yawDeg)
+  float pitchRad = pitchDeg * PI / 180.0f;
+  float yawRad   = yawDeg   * PI / 180.0f;
 
-  // 1) Compute constant thrust = THRUST_FACTOR × weight
-  float thrust = MASS_TOTAL * GRAVITY * THRUST_FACTOR;
+  // Body‐axis unit vector (in inertial frame):
+  float ux = sin(pitchRad) * cos(yawRad);
+  float uy = sin(pitchRad) * sin(yawRad);
+  float uz = cos(pitchRad);
 
-  // 2) Decompose into inertial axes
-  float pitchRad = pitchDeg * PI / 180.0;
-  float yawRad   = yawDeg   * PI / 180.0;
-  float t_x = thrust * sin(pitchRad) * cos(yawRad);
-  float t_y = thrust * sin(pitchRad) * sin(yawRad);
-  float t_z = thrust * cos(pitchRad);
+  accX = ACC_MAGNITUDE * ux;
+  accY = ACC_MAGNITUDE * uy;
+  accZ = ACC_MAGNITUDE * uz;
 
-  // 3) Compute drag magnitude
-  float dragMag = computeDragMagnitude(velX, velY, velZ);
-  float speed   = sqrt(velX*velX + velY*velY + velZ*velZ) + 1e-6;
-  float dragX = dragMag * (velX / speed);
-  float dragY = dragMag * (velY / speed);
-  float dragZ = dragMag * (velZ / speed);
-
-  // 4) Net forces
-  float FnetX = t_x - dragX;
-  float FnetY = t_y - dragY;
-  float FnetZ = t_z - (MASS_TOTAL * GRAVITY) - dragZ;
-
-  // 5) Accelerations
-  accX = FnetX / MASS_TOTAL;
-  accY = FnetY / MASS_TOTAL;
-  accZ = FnetZ / MASS_TOTAL;
-
-  // 6) Update velocities
+  // Integrate velocity
   velX += accX * dt;
   velY += accY * dt;
   velZ += accZ * dt;
 
-  // 7) Update positions
+  // Integrate position
   posX += velX * dt;
   posY += velY * dt;
   posZ += velZ * dt;
 }
 
-// === COMPUTE DRAG MAGNITUDE ===
-float computeDragMagnitude(float vx, float vy, float vz) {
-  float speed = sqrt(vx*vx + vy*vy + vz*vz);
-  return 0.5 * AIR_DENSITY * speed * speed * AREA_ROCKET * CD_ROCKET;
-}
-
 // === STUB: ATTITUDE FROM IMU ===
 void computeAttitudeFromIMU(float dt) {
-  // If you have a real IMU/MPU6050, insert fusion code here to update:
-  //   pitchDeg, yawDeg, rollDeg, pitchRate, yawRate, rollRate.
-  // Otherwise, attitude is updated in autoModeLoop().
+  // If you have an IMU or MPU6050 + filter, insert the code here
+  // to update pitchDeg, yawDeg, rollDeg, pitchRate, yawRate, rollRate.
+  // Otherwise, attitude is driven by our PD loop in autoModeLoop().
 }
 
 // === SET ALL FINS ===
@@ -431,8 +418,8 @@ void setAllFins(float frontDeg, float rightDeg, float backDeg, float leftDeg) {
 
 // === MAP JOYSTICK READING TO ±FIN_ANGLE_MAX ===
 float mapJoystickToAngle(int reading) {
-  float norm = (reading - 512.0) / 512.0;  // -1..+1
-  if (norm > 1.0) norm = 1.0;
-  if (norm < -1.0) norm = -1.0;
+  float norm = (reading - 512.0f) / 512.0f;  // -1..+1
+  if (norm > 1.0f)  norm = 1.0f;
+  if (norm < -1.0f) norm = -1.0f;
   return norm * FIN_ANGLE_MAX;
 }
